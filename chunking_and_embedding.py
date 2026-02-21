@@ -1,10 +1,10 @@
 import json
 import re
+import os
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor
 from FlagEmbedding import BGEM3FlagModel
 
-
-# Adjusted to accept a dictionary directly instead of a file path
 def get_structural_chunks_from_dict(data, target_tokens=150):
     protocol_id = data.get('protocol_id', 'unknown')
     icd_codes = data.get('icd_codes', [])
@@ -65,38 +65,69 @@ def get_structural_chunks_from_dict(data, target_tokens=150):
     return structured_chunks
 
 
-# --- PROCESSING AND STORING ---
-# 1. Load Model (ensure local path for competition)
-model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+def encode_on_gpu(gpu_id, chunks):
+    """Loads the model on a specific GPU and processes a subset of chunks."""
+    # If a chunk list happens to be empty (e.g., fewer chunks than GPUs), skip gracefully
+    if not chunks:
+        return {'dense_vecs': np.array([]), 'lexical_weights': np.array([])}
 
-all_chunks = []
-jsonl_file_path = 'corpus/protocols_corpus.jsonl'
+    # Hide the other GPUs from this process
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    
+    # Load Model onto the assigned GPU
+    model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+    
+    corpus_texts = [c['content'] for c in chunks]
+    outputs = model.encode(corpus_texts, return_dense=True, return_sparse=True)
+    
+    return outputs
 
-# Read the JSONL file line by line
-with open(jsonl_file_path, 'r', encoding='utf-8') as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
 
-        # Parse the JSON string into a Python dictionary
-        data = json.loads(line)
+if __name__ == '__main__':
+    NUM_GPUS = 5  # <--- Change this if your hardware setup changes
+    
+    # 1. Parse JSONL
+    all_chunks = []
+    jsonl_file_path = 'corpus/protocols_corpus.jsonl'
 
-        # Process the dictionary and append chunks
-        all_chunks.extend(get_structural_chunks_from_dict(data))
+    with open(jsonl_file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            data = json.loads(line)
+            all_chunks.extend(get_structural_chunks_from_dict(data))
 
-# 2. Generate Hybrid Embeddings
-# BGE-M3 generates both Dense and Sparse in one pass
-corpus_texts = [c['content'] for c in all_chunks]
-outputs = model.encode(corpus_texts, return_dense=True, return_sparse=True)
+    print(f"Total chunks extracted: {len(all_chunks)}")
 
-# 3. Save to disk for Inference
-# We save chunks as JSON and embeddings as NPZ/Pickle
-with open('processed_corpus.json', 'w', encoding='utf-8') as f:
-    json.dump(all_chunks, f, ensure_ascii=False)
+    # 2. Split chunks dynamically into NUM_GPUS parts
+    # This math safely divides the list into N almost-equal sized lists
+    k, m = divmod(len(all_chunks), NUM_GPUS)
+    chunk_splits = [all_chunks[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(NUM_GPUS)]
 
-np.savez('embeddings.npz',
-         dense=outputs['dense_vecs'],
-         sparse=np.array(outputs['lexical_weights'], dtype=object))
+    print(f"Distributing chunks across {NUM_GPUS} GPUs...")
+    for i, split in enumerate(chunk_splits):
+        print(f"GPU {i} will process: {len(split)} chunks")
 
-print(f"Stored {len(all_chunks)} chunks with dense and sparse vectors.")
+    # 3. Run parallel processing across all GPUs
+    results = []
+    with ProcessPoolExecutor(max_workers=NUM_GPUS) as executor:
+        # Submit tasks in a loop
+        futures = [executor.submit(encode_on_gpu, i, chunk_splits[i]) for i in range(NUM_GPUS)]
+        
+        # Collect results in order
+        for future in futures:
+            results.append(future.result())
+
+    # 4. Merge results back together in the correct order
+    merged_dense = np.concatenate([res['dense_vecs'] for res in results if len(res['dense_vecs']) > 0], axis=0)
+    merged_sparse = np.concatenate([res['lexical_weights'] for res in results if len(res['lexical_weights']) > 0], axis=0)
+
+    # 5. Save to disk
+    with open('processed_corpus.json', 'w', encoding='utf-8') as f:
+        json.dump(all_chunks, f, ensure_ascii=False)
+
+    np.savez('embeddings.npz',
+             dense=merged_dense,
+             sparse=merged_sparse)
+
+    print(f"Successfully processed and stored {len(all_chunks)} chunks using {NUM_GPUS} GPUs.")
