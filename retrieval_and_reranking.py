@@ -26,15 +26,12 @@ class MedicalRetriever:
         with open(corpus_path, 'r', encoding='utf-8') as f:
             self.corpus = json.load(f)
 
-        # Dense embeddings — standard numpy array
         data = np.load(embed_path, allow_pickle=True)
         self.dense_embeddings = data['dense']  # shape: (N, dim)
 
-        # FIX 1: Sparse weights loaded from JSON (list of dicts, not npz)
         with open(sparse_path, 'r', encoding='utf-8') as f:
-            self.sparse_embeddings = json.load(f)
+            self.sparse_embeddings = json.load(f)  # list of dicts: token -> float
 
-        # FIX 2: BM25 index loaded for exact ICD code / medical term matching
         with open(bm25_path, 'rb') as f:
             self.bm25 = pickle.load(f)
 
@@ -55,24 +52,23 @@ class MedicalRetriever:
           - Dense (BGE-M3):  semantic symptom-to-disease matching
           - Sparse (BGE-M3): subword lexical overlap
           - BM25:            exact ICD code / alphanumeric term matching
+        Then cross-encoder reranking on the top_k candidates.
         """
         q_out = self.embed_model.encode([query_text], return_dense=True, return_sparse=True)
-        q_dense = q_out['dense_vecs'][0]       # shape: (dim,)
-        q_sparse = q_out['lexical_weights'][0]  # dict: token -> weight
+        q_dense = q_out['dense_vecs'][0]        # shape: (dim,)
+        q_sparse = q_out['lexical_weights'][0]   # dict: token -> weight
 
-        # FIX 3: Vectorised dense scoring — replaces the slow Python loop
-        dense_scores = self.dense_embeddings @ q_dense  # shape: (N,), runs in ms
+        # Vectorised dense scoring over the full corpus
+        dense_scores = self.dense_embeddings @ q_dense  # shape: (N,)
 
-        # BM25 scores for all docs in one call
-        bm25_scores = np.array(self.bm25.get_scores(query_text.split()))  # shape: (N,)
-
-        # Normalise BM25 to [0, 1] so it's on the same scale as cosine scores
+        # BM25 scores, normalised to [0, 1]
+        bm25_scores = np.array(self.bm25.get_scores(query_text.split()))
         bm25_max = bm25_scores.max()
         if bm25_max > 0:
             bm25_scores = bm25_scores / bm25_max
 
-        # FIX 4: Pre-filter with dense top-100 before computing sparse scores
-        # Sparse scoring over 300k dicts is expensive; only do it on the top candidates
+        # Pre-filter to dense top-100 before computing sparse scores
+        # (sparse scoring is a Python dict loop — too slow over the full corpus)
         dense_top100_indices = np.argpartition(dense_scores, -100)[-100:]
 
         scores = []
@@ -85,8 +81,21 @@ class MedicalRetriever:
             )
             scores.append((int(i), hybrid_score))
 
-        top_indices = sorted(scores, key=lambda x: x[1], reverse=True)[:top_k]
-        candidates = [self.corpus[i] for i, _ in top_indices]
+        # Deduplicate by protocol: keep only the best-scoring chunk per protocol_id.
+        # Boilerplate is gone (stripped at chunking time), so the best chunk is now
+        # genuinely the most relevant clinical content chunk for this protocol.
+        seen_protocols = {}
+        for idx, score in sorted(scores, key=lambda x: x[1], reverse=True)[:top_k * 3]:
+            pid = self.corpus[idx]['metadata'].get('protocol_id', idx)
+            if pid not in seen_protocols or score > seen_protocols[pid][1]:
+                seen_protocols[pid] = (idx, score)
+
+        # Re-sort deduped results, drop protocols with no ICD codes, take top_k
+        deduped = sorted(seen_protocols.values(), key=lambda x: x[1], reverse=True)[:top_k]
+        candidates = [
+            self.corpus[idx] for idx, _ in deduped
+            if self.corpus[idx]['metadata'].get('icd_codes')
+        ]
 
         # Cross-encoder reranking
         rerank_pairs = [[query_text, cand['content']] for cand in candidates]
@@ -99,10 +108,10 @@ class MedicalRetriever:
 
 
 if __name__ == "__main__":
-    CORPUS_FILE  = 'processed_corpus.json'
-    EMBED_FILE   = 'embeddings.npz'
-    SPARSE_FILE  = 'sparse_weights.json'
-    BM25_FILE    = 'bm25_index.pkl'
+    CORPUS_FILE = 'processed_corpus.json'
+    EMBED_FILE  = 'embeddings.npz'
+    SPARSE_FILE = 'sparse_weights.json'
+    BM25_FILE   = 'bm25_index.pkl'
 
     missing = [f for f in [CORPUS_FILE, EMBED_FILE, SPARSE_FILE, BM25_FILE]
                if not os.path.exists(f)]
