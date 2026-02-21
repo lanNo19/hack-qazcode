@@ -1,0 +1,11 @@
+{
+  "submission_name": "uno",
+  "total_protocols": 180,
+  "accuracy_at_1_percent": 2.22,
+  "recall_at_3_percent": 42.22,
+  "latency_avg_s": 2.398,
+  "latency_min_s": 1.028,
+  "latency_max_s": 41.782,
+  "latency_p50_s": 1.98,
+  "latency_p95_s": 2.318
+}
