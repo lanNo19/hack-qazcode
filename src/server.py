@@ -25,46 +25,46 @@ HUB_URL   = os.environ.get("HUB_URL", "YOUR_HUB_URL")
 API_KEY   = os.environ.get("API_KEY", "YOUR_API_KEY")
 LLM_MODEL = "oss-120b"
 
-CORPUS_FILE = os.environ.get("CORPUS_FILE", "processed_corpus.json")
-EMBED_FILE  = os.environ.get("EMBED_FILE",  "embeddings.npz")
-SPARSE_FILE = os.environ.get("SPARSE_FILE", "sparse_weights.json")
-BM25_FILE   = os.environ.get("BM25_FILE",   "bm25_index.pkl")
+CORPUS_FILE   = os.environ.get("CORPUS_FILE",   "processed_corpus.json")
+EMBED_FILE    = os.environ.get("EMBED_FILE",    "embeddings.npz")
+SPARSE_FILE   = os.environ.get("SPARSE_FILE",   "sparse_weights.json")
+BM25_FILE     = os.environ.get("BM25_FILE",     "bm25_index.pkl")
+ICD_DESC_FILE = os.environ.get("ICD_DESC_FILE", "icd_descriptions.json")
 
 LLM_TIMEOUT  = 15.0
-RERANK_TOP_N = 5
+RETRIEVE_K   = 20   # candidates before reranking
+RERANK_TOP_N = 5    # unique protocols to keep after reranking
 
 # ---------------------------------------------------------------------------
 # System prompt
-# Key changes vs previous version:
-# - Tell the LLM the protocols are PRE-RANKED by a medical reranker
-# - Ask it to pick the MOST SPECIFIC matching ICD code from each protocol's list
-# - Chain-of-thought: match symptoms → confirm → rank
+# Modelled after the notebook's structured JSON approach.
+# The LLM receives: a dict of ICD code → description (only the ones retrieved),
+# plus the patient symptoms. It returns top-3 ranked by likelihood.
+# No chunk text is sent — the descriptions alone give enough signal.
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """\
-Ты — система клинической поддержки принятия решений на основе клинических протоколов МЗ РК.
+Ты — опытный врач-клиницист и система поддержки принятия диагностических решений \
+на основе клинических протоколов Министерства здравоохранения Республики Казахстан.
 
-Тебе даны симптомы пациента и список протоколов, УЖЕ отсортированных по релевантности \
-медицинским алгоритмом (Протокол 1 = наиболее релевантный по симптомам).
+Тебе предоставлены:
+1. Симптомы пациента
+2. Словарь кодов МКБ-10 с описаниями — ТОЛЬКО из протоколов, релевантных симптомам
 
-ЗАДАЧА: для каждого протокола выбери НАИБОЛЕЕ СПЕЦИФИЧНЫЙ код МКБ-10, который соответствует \
-симптомам пациента, и подтверди соответствие симптомов.
+ЗАДАЧА: выбери 3 наиболее подходящих диагноза из CANDIDATE_CODES.
 
-ПРАВИЛА:
-1. "icd10_code" — ТОЛЬКО из AVAILABLE_ICD_CODES данного протокола. Выбери наиболее специфичный \
-(например, "S06.3" точнее, чем "S06").
-2. "diagnosis" — официальное медицинское название (3-7 слов). НЕ копируй текст протокола.
-3. "explanation" — 1 предложение: какие конкретные симптомы пациента совпадают с критериями.
-4. Сохраняй порядок протоколов: Протокол 1 → rank 1, если нет веских причин изменить.
-5. Верни ровно 5 объектов в списке diagnoses.
+ЖЁСТКИЕ ПРАВИЛА — нарушение любого делает ответ недействительным:
+1. "icd10_code" — ТОЛЬКО коды из CANDIDATE_CODES. Запрещено придумывать коды.
+2. Каждый код должен содержать точку (например, E06.9, F32.0). Коды без точки ЗАПРЕЩЕНЫ.
+3. Все три кода должны быть РАЗНЫМИ. Повторение кода запрещено.
+4. "name" — название из описания в CANDIDATE_CODES.
+5. "reasoning" — ровно 1 предложение о совпадении симптомов.
 
-Отвечай ТОЛЬКО валидным JSON без markdown:
+Отвечай ТОЛЬКО валидным JSON без markdown-обёртки:
 {
   "diagnoses": [
-    {"rank": 1, "icd10_code": "A00.0", "diagnosis": "Название", "explanation": "Обоснование."},
-    {"rank": 2, "icd10_code": "B00.0", "diagnosis": "Название", "explanation": "Обоснование."},
-    {"rank": 3, "icd10_code": "C00.0", "diagnosis": "Название", "explanation": "Обоснование."},
-    {"rank": 4, "icd10_code": "D00.0", "diagnosis": "Название", "explanation": "Обоснование."},
-    {"rank": 5, "icd10_code": "E00.0", "diagnosis": "Название", "explanation": "Обоснование."}
+    {"rank": 1, "icd10_code": "A00.0", "name": "...", "reasoning": "..."},
+    {"rank": 2, "icd10_code": "B00.0", "name": "...", "reasoning": "..."},
+    {"rank": 3, "icd10_code": "C00.0", "name": "...", "reasoning": "..."}
   ]
 }
 """
@@ -72,17 +72,27 @@ SYSTEM_PROMPT = """\
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
-retriever: MedicalRetriever = None
-llm_client: OpenAI = None
+retriever:    MedicalRetriever = None
+llm_client:   OpenAI           = None
+icd_descriptions: dict         = {}   # code -> Russian description
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global retriever, llm_client
+    global retriever, llm_client, icd_descriptions
     print("\n🏥 Medical Diagnosis Server")
     print("=" * 40)
+
+    # ICD descriptions (built by parse_icd_descriptions.py)
+    if os.path.exists(ICD_DESC_FILE):
+        with open(ICD_DESC_FILE, 'r', encoding='utf-8') as f:
+            icd_descriptions = json.load(f)
+        print(f"Loaded {len(icd_descriptions)} ICD descriptions")
+    else:
+        print(f"Warning: {ICD_DESC_FILE} not found — codes will be sent without descriptions")
+
     print("Loading retriever...")
-    retriever = MedicalRetriever(CORPUS_FILE, EMBED_FILE, SPARSE_FILE, BM25_FILE)
+    retriever  = MedicalRetriever(CORPUS_FILE, EMBED_FILE, SPARSE_FILE, BM25_FILE)
     llm_client = OpenAI(base_url=HUB_URL, api_key=API_KEY, timeout=LLM_TIMEOUT)
     print("✓ Ready. POST /diagnose")
     print("=" * 40 + "\n")
@@ -93,53 +103,109 @@ app = FastAPI(title="Medical Diagnosis Server", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
-# Models — FIX 422: use Optional with None default so missing fields don't fail
+# Pydantic models
 # ---------------------------------------------------------------------------
 class DiagnoseRequest(BaseModel):
     symptoms: str | None = None
 
 class Diagnosis(BaseModel):
-    rank: int
+    rank:       int
     icd10_code: str
-    diagnosis: str
-    explanation: str
+    name:       str
+    reasoning:  str
 
 class DiagnoseResponse(BaseModel):
     diagnoses: list[Diagnosis]
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Core helpers
 # ---------------------------------------------------------------------------
-def build_context(chunks: list[dict]) -> tuple[str, list[str]]:
+
+def top_protocols(symptoms: str) -> list[dict]:
     """
-    Format chunks for LLM. Each protocol block includes:
-    - Its pre-rank position (so LLM knows ordering is already meaningful)
-    - Its own ICD codes listed explicitly
-    - First 400 chars of content
+    Retrieve and rerank candidates, then deduplicate to unique protocols.
+    Returns up to RERANK_TOP_N protocol chunks (one per protocol).
+
+    Deduplication happens AFTER reranking so the best-scored chunk per
+    protocol is kept — not just any chunk from that protocol.
     """
-    parts = []
-    all_icd = []
+    candidates = retriever.retrieve(symptoms, top_k=RETRIEVE_K, rerank_top_n=RETRIEVE_K)
 
-    for i, chunk in enumerate(chunks, 1):
-        icd_codes = chunk["metadata"].get("icd_codes", [])
-        all_icd.extend(icd_codes)
-        content_preview = chunk["content"][:400].strip()
-        parts.append(
-            f"[Протокол {i} (релевантность: {i}/5) | Коды МКБ-10: {', '.join(icd_codes) or 'н/д'}]\n"
-            f"{content_preview}"
-        )
+    seen: set = set()
+    unique: list = []
+    for chunk in candidates:                           # already sorted by rerank_score desc
+        pid = chunk["metadata"].get("protocol_id")
+        if pid not in seen and chunk["metadata"].get("icd_codes"):
+            seen.add(pid)
+            unique.append(chunk)
+        if len(unique) >= RERANK_TOP_N:
+            break
 
-    seen = set()
-    unique_icd = [c for c in all_icd if not (c in seen or seen.add(c))]
-    return "\n\n".join(parts), unique_icd
+    return unique
 
 
-def call_llm(symptoms: str, context: str, available_icd: list[str]) -> list[dict]:
+def expand_code(code: str) -> dict[str, str]:
+    """
+    Turn one ICD code into a {code: description} dict of precise entries.
+
+    - Dot-code (e.g. O14.1): look up directly in icd_descriptions.
+      If found, return it. If not, return the code with itself as placeholder.
+    - Bare parent code (e.g. O14, O99): expand to ALL O14.x / O99.x entries
+      present in icd_descriptions. If none exist, return the bare code as
+      a placeholder so the protocol is never silently dropped.
+    """
+    if '.' in code:
+        desc = icd_descriptions.get(code, code)
+        return {code: desc}
+    else:
+        # Expand to every known subcode whose prefix matches
+        prefix = code + '.'
+        subcodes = {k: v for k, v in icd_descriptions.items() if k.startswith(prefix)}
+        if subcodes:
+            return subcodes
+        # No subcodes known at all — keep the bare code as a last resort
+        return {code: code}
+
+
+def build_candidate_dict(chunks: list[dict]) -> dict[str, str]:
+    """
+    Build an ordered {icd_code: description} dict from the retrieved chunks.
+
+    Chunks arrive sorted by rerank score (best first). Python dicts preserve
+    insertion order, so codes from the top-ranked protocol are inserted first
+    and appear first in the formatted prompt — giving the LLM an implicit
+    ordering signal that earlier entries are more likely matches.
+
+    Expansion: dot-codes added as-is; bare parent codes (e.g. O14) expanded
+    to all known O14.x subcodes from icd_descriptions. First protocol wins
+    on duplicate codes across protocols.
+    """
+    candidate: dict[str, str] = {}
+    for chunk in chunks:
+        for code in chunk["metadata"].get("icd_codes", []):
+            for expanded_code, desc in expand_code(code).items():
+                if expanded_code not in candidate:
+                    candidate[expanded_code] = desc
+    return candidate
+
+
+def call_llm(symptoms: str, candidate_codes: dict[str, str]) -> list[dict]:
+    """
+    Send symptoms + candidate ICD dict to the LLM.
+    Returns the parsed diagnoses list, or raises on failure.
+    """
+    # Format as a numbered list in rerank order.
+    # Codes from the highest-ranked protocol come first — the LLM should treat
+    # earlier entries as more likely matches for the given symptoms.
+    lines = [f"  {i}. {code}: {desc}"
+             for i, (code, desc) in enumerate(candidate_codes.items(), 1)]
+    codes_text = "\n".join(lines)
+
     user_message = (
-        f"AVAILABLE_ICD_CODES (все допустимые коды): {', '.join(available_icd)}\n\n"
-        f"ПРОТОКОЛЫ (отсортированы по релевантности, 1 = наиболее подходящий):\n{context}\n\n"
-        f"СИМПТОМЫ ПАЦИЕНТА: {symptoms}"
+        f"СИМПТОМЫ ПАЦИЕНТА:\n{symptoms}\n\n"
+        f"CANDIDATE_CODES (отсортированы по убыванию вероятности — "
+        f"код №1 наиболее вероятен по результатам поиска):\n{codes_text}"
     )
 
     response = llm_client.chat.completions.create(
@@ -152,44 +218,33 @@ def call_llm(symptoms: str, context: str, available_icd: list[str]) -> list[dict
     )
 
     raw = response.choices[0].message.content.strip()
+    # Strip markdown fences if present
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
+    raw = re.sub(r"\s*```$",          "", raw)
     return json.loads(raw).get("diagnoses", [])
 
 
-def fallback_diagnoses(chunks: list[dict]) -> list[Diagnosis]:
-    """Return retrieval results directly when LLM fails — clean names, no raw chunk text."""
-    diagnoses = []
-    seen_protocols = set()
-    rank = 1
-
-    for chunk in chunks:
-        pid = chunk["metadata"].get("protocol_id")
-        if pid in seen_protocols:
+def fallback_diagnoses(chunks: list[dict], candidate_codes: dict[str, str]) -> list[Diagnosis]:
+    """
+    Used when the LLM fails. Returns the top-3 protocols directly,
+    using the first dot-code per protocol as the ICD code.
+    """
+    results = []
+    for i, chunk in enumerate(chunks[:3], 1):
+        # Pick first dot-code available
+        code = next(
+            (c for c in chunk["metadata"].get("icd_codes", []) if '.' in c),
+            None
+        )
+        if not code:
             continue
-        seen_protocols.add(pid)
-
-        icd_codes = chunk["metadata"].get("icd_codes", [])
-        if not icd_codes:
-            continue
-
-        context_match = re.match(r'\[([^\]>]+)', chunk["content"])
-        protocol_name = context_match.group(1).strip() if context_match else "Неизвестно"
-
-        lines = chunk["content"].split("\n")
-        explanation = next((l.strip() for l in lines[1:] if len(l.strip()) > 20), "")[:200]
-
-        diagnoses.append(Diagnosis(
-            rank=rank,
-            icd10_code=icd_codes[0],
-            diagnosis=protocol_name,
-            explanation=explanation,
+        results.append(Diagnosis(
+            rank=i,
+            icd10_code=code,
+            name=candidate_codes.get(code, code),
+            reasoning="(LLM недоступен — результат по близости эмбеддинга)",
         ))
-        rank += 1
-        if rank > 5:
-            break
-
-    return diagnoses
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -201,25 +256,47 @@ async def handle_diagnose(request: DiagnoseRequest) -> DiagnoseResponse:
     if not symptoms:
         return DiagnoseResponse(diagnoses=[])
 
-    retrieved = retriever.retrieve(symptoms, top_k=20, rerank_top_n=RERANK_TOP_N)
-    context, available_icd = build_context(retrieved)
+    # 1. Retrieve top-5 unique protocols
+    chunks = top_protocols(symptoms)
+    if not chunks:
+        return DiagnoseResponse(diagnoses=[])
 
+    # 2. Build ICD code → description dict from retrieved protocols only
+    candidate_codes = build_candidate_dict(chunks)
+    if not candidate_codes:
+        return DiagnoseResponse(diagnoses=[])
+
+    # 3. Ask LLM to pick top-3 from the candidate dict
     try:
-        raw_diagnoses = call_llm(symptoms, context, available_icd)
-        diagnoses = [
-            Diagnosis(
-                rank=d.get("rank", i + 1),
-                icd10_code=d.get("icd10_code", "").strip(),
-                diagnosis=d.get("diagnosis", "").strip(),
-                explanation=d.get("explanation", "").strip(),
-            )
-            for i, d in enumerate(raw_diagnoses)
-        ]
+        raw = call_llm(symptoms, candidate_codes)
+
+        # Parse, validate, and deduplicate
+        seen_codes: set = set()
+        diagnoses = []
+        rank = 1
+        for d in raw:
+            code = d.get("icd10_code", "").strip()
+            if not code or "." not in code:        # reject bare codes
+                continue
+            if code in seen_codes:                  # reject duplicates
+                continue
+            if code not in candidate_codes:         # reject hallucinations
+                print(f"  Skipped hallucinated code: {code}")
+                continue
+            seen_codes.add(code)
+            diagnoses.append(Diagnosis(
+                rank=rank,
+                icd10_code=code,
+                name=d.get("name", candidate_codes.get(code, code)).strip(),
+                reasoning=d.get("reasoning", "").strip(),
+            ))
+            rank += 1
+
         if not diagnoses:
-            raise ValueError("empty diagnoses from LLM")
+            raise ValueError("LLM returned no valid codes")
     except Exception as e:
-        print(f"LLM failed ({type(e).__name__}: {e}) — fallback")
-        diagnoses = fallback_diagnoses(retrieved)
+        print(f"LLM failed ({type(e).__name__}: {e}) — using fallback")
+        diagnoses = fallback_diagnoses(chunks, candidate_codes)
 
     return DiagnoseResponse(diagnoses=diagnoses)
 
@@ -275,6 +352,7 @@ HTML_UI = """<!DOCTYPE html>
     .rank {
       background: #0ea5e9; color: white; font-weight: 700;
       border-radius: 6px; padding: 0.15rem 0.55rem; font-size: 0.85rem;
+      min-width: 2rem; text-align: center;
     }
     .icd-code {
       font-family: monospace; background: #0f172a;
@@ -282,16 +360,19 @@ HTML_UI = """<!DOCTYPE html>
       padding: 0.15rem 0.5rem; font-size: 0.9rem; color: #7dd3fc;
     }
     .diagnosis-name { font-weight: 600; font-size: 1rem; color: #f1f5f9; }
-    .explanation { color: #94a3b8; font-size: 0.88rem; line-height: 1.5; }
+    .reasoning { color: #94a3b8; font-size: 0.88rem; line-height: 1.5; margin-top: 0.3rem; }
     .loading { text-align: center; color: #38bdf8; padding: 2rem; font-size: 0.95rem; }
-    .error { background: #450a0a; border: 1px solid #991b1b; color: #fca5a5; border-radius: 10px; padding: 1rem; }
+    .error { background: #450a0a; border: 1px solid #991b1b; color: #fca5a5;
+             border-radius: 10px; padding: 1rem; }
   </style>
 </head>
 <body>
 <div class="container">
   <h1>🏥 Диагностический ассистент</h1>
   <p class="subtitle">Казахстанские клинические протоколы · МКБ-10</p>
-  <textarea id="symptoms" placeholder="Введите симптомы пациента на русском языке...&#10;&#10;Например: острая боль в правом подреберье, тошнота, срок беременности 32 недели"></textarea>
+  <textarea id="symptoms"
+    placeholder="Введите симптомы пациента на русском языке...&#10;&#10;Например: острая боль в правом подреберье, тошнота, срок беременности 32 недели"
+  ></textarea>
   <button id="submit-btn" onclick="diagnose()">Определить диагноз</button>
   <div id="results"></div>
 </div>
@@ -316,17 +397,18 @@ async function diagnose() {
       resultsDiv.innerHTML = '<div class="error">Диагнозы не найдены. Попробуйте уточнить симптомы.</div>';
       return;
     }
-    const sorted = [...data.diagnoses].sort((a, b) => a.rank - b.rank);
-    resultsDiv.innerHTML = sorted.map(d => `
-      <div class="card">
-        <div class="card-header">
-          <span class="rank">#${d.rank}</span>
-          <span class="icd-code">${d.icd10_code}</span>
-          <span class="diagnosis-name">${d.diagnosis}</span>
+    resultsDiv.innerHTML = data.diagnoses
+      .sort((a, b) => a.rank - b.rank)
+      .map(d => `
+        <div class="card">
+          <div class="card-header">
+            <span class="rank">#${d.rank}</span>
+            <span class="icd-code">${d.icd_code}</span>
+            <span class="diagnosis-name">${d.name}</span>
+          </div>
+          <p class="reasoning">${d.reasoning}</p>
         </div>
-        <p class="explanation">${d.explanation}</p>
-      </div>
-    `).join('');
+      `).join('');
   } catch (err) {
     resultsDiv.innerHTML = `<div class="error">Ошибка: ${err.message}</div>`;
   } finally {
