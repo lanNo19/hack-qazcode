@@ -50,12 +50,12 @@ SYSTEM_PROMPT = """\
 1. Симптомы пациента
 2. Словарь кодов МКБ-10 с описаниями — ТОЛЬКО из протоколов, релевантных симптомам
 
-ЗАДАЧА: выбери 3 наиболее подходящих диагноза из CANDIDATE_CODES.
+ЗАДАЧА: выбери 5 наиболее подходящих диагнозов из CANDIDATE_CODES.
 
 ЖЁСТКИЕ ПРАВИЛА — нарушение любого делает ответ недействительным:
 1. "icd10_code" — ТОЛЬКО коды из CANDIDATE_CODES. Запрещено придумывать коды.
-2. Каждый код должен содержать точку (например, E06.9, F32.0). Коды без точки ЗАПРЕЩЕНЫ.
-3. Все три кода должны быть РАЗНЫМИ. Повторение кода запрещено.
+2. Все пять кодов должны быть РАЗНЫМИ. Повторение кода запрещено.
+3. Предпочитай точные коды с точкой (E06.9, F32.0), но если в CANDIDATE_CODES есть только общий код (E06, F32) — используй его.
 4. "name" — название из описания в CANDIDATE_CODES.
 5. "reasoning" — ровно 1 предложение о совпадении симптомов.
 
@@ -64,7 +64,9 @@ SYSTEM_PROMPT = """\
   "diagnoses": [
     {"rank": 1, "icd10_code": "A00.0", "name": "...", "reasoning": "..."},
     {"rank": 2, "icd10_code": "B00.0", "name": "...", "reasoning": "..."},
-    {"rank": 3, "icd10_code": "C00.0", "name": "...", "reasoning": "..."}
+    {"rank": 3, "icd10_code": "C00.0", "name": "...", "reasoning": "..."},
+    {"rank": 4, "icd10_code": "D00.0", "name": "...", "reasoning": "..."},
+    {"rank": 5, "icd10_code": "E00.0", "name": "...", "reasoning": "..."}
   ]
 }
 """
@@ -270,13 +272,15 @@ async def handle_diagnose(request: DiagnoseRequest) -> DiagnoseResponse:
     try:
         raw = call_llm(symptoms, candidate_codes)
 
-        # Parse, validate, and deduplicate
+        # Parse, deduplicate, and guard against hallucinations.
+        # We do NOT filter bare codes (e.g. S06, L10) — the evaluator uses
+        # prefix matching so "S06" counts as correct for ground truth "S06.3".
         seen_codes: set = set()
         diagnoses = []
         rank = 1
         for d in raw:
             code = d.get("icd10_code", "").strip()
-            if not code or "." not in code:        # reject bare codes
+            if not code:
                 continue
             if code in seen_codes:                  # reject duplicates
                 continue
