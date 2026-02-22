@@ -10,6 +10,12 @@ git clone https://github.com//hack-qazcode.git](https://github.com/lanNo19/hack-
 cd hack-qazcode
 ```
 
+## Build
+
+```bash
+docker build -t submission .
+```
+
 ## Run
 
 ```bash
