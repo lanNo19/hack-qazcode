@@ -48,16 +48,18 @@ SYSTEM_PROMPT = """\
 
 Тебе предоставлены:
 1. Симптомы пациента
-2. Словарь кодов МКБ-10 с описаниями — ТОЛЬКО из протоколов, релевантных симптомам
+2. Выдержки из клинических протоколов (тексты), релевантные симптомам
+3. Словарь кодов МКБ-10 с описаниями — ТОЛЬКО из протоколов, релевантных симптомам
 
-ЗАДАЧА: выбери 5 наиболее подходящих диагнозов из CANDIDATE_CODES.
+ЗАДАЧА: выбери до 5 наиболее подходящих диагнозов из CANDIDATE_CODES, строго основываясь на предоставленных текстах протоколов.
 
 ЖЁСТКИЕ ПРАВИЛА — нарушение любого делает ответ недействительным:
 1. "icd10_code" — ТОЛЬКО коды из CANDIDATE_CODES. Запрещено придумывать коды.
-2. Все пять кодов должны быть РАЗНЫМИ. Повторение кода запрещено.
-3. Предпочитай точные коды с точкой (E06.9, F32.0), но если в CANDIDATE_CODES есть только общий код (E06, F32) — используй его.
-4. "name" — название из описания в CANDIDATE_CODES.
-5. "reasoning" — ровно 1 предложение о совпадении симптомов.
+2. Все выбранные коды должны быть РАЗНЫМИ.
+3. СТРОГИЙ ФИЛЬТР: Внимательно читай тексты протоколов! Если протокол требует наличия специфических или тяжелых симптомов (например, сыпь, кровотечение, определенные лабораторные показатели), которых НЕТ в описании пациента, ты ОБЯЗАН исключить этот диагноз, даже если он есть в списке кандидатов.
+4. Предпочитай точные коды с точкой (E06.9, F32.0). Если в CANDIDATE_CODES есть только общий код (E06) — используй его.
+5. "name" — название из описания в CANDIDATE_CODES.
+6. "reasoning" — ровно 1 предложение, объясняющее совпадение симптомов пациента с критериями именно из ТЕКСТА протокола.
 
 Отвечай ТОЛЬКО валидным JSON без markdown-обёртки:
 {
@@ -192,22 +194,31 @@ def build_candidate_dict(chunks: list[dict]) -> dict[str, str]:
     return candidate
 
 
-def call_llm(symptoms: str, candidate_codes: dict[str, str]) -> list[dict]:
+def call_llm(symptoms: str, candidate_codes: dict[str, str], chunks: list[dict]) -> list[dict]:
     """
-    Send symptoms + candidate ICD dict to the LLM.
+    Send symptoms, candidate ICD dict, and retrieved chunks to the LLM.
     Returns the parsed diagnoses list, or raises on failure.
     """
-    # Format as a numbered list in rerank order.
-    # Codes from the highest-ranked protocol come first — the LLM should treat
-    # earlier entries as more likely matches for the given symptoms.
+    # Format candidate codes
     lines = [f"  {i}. {code}: {desc}"
              for i, (code, desc) in enumerate(candidate_codes.items(), 1)]
     codes_text = "\n".join(lines)
 
+    # Format chunk texts for the LLM to read
+    chunks_text = ""
+    for i, chunk in enumerate(chunks[:3], 1):
+        # We extract the protocol title if available, otherwise just number it
+        protocol_title = chunk.get("metadata", {}).get("title", f"Протокол {i}")
+        content = chunk.get("content", "").strip()
+        if len(content) > 1500:
+            content = content[:1500] + "... [ОСТАЛЬНОЙ ТЕКСТ УРЕЗАН]"
+        
+        chunks_text += f"\n--- ТЕКСТ ПРОТОКОЛА {i}: {protocol_title} ---\n{content}\n"
+
     user_message = (
         f"СИМПТОМЫ ПАЦИЕНТА:\n{symptoms}\n\n"
-        f"CANDIDATE_CODES (отсортированы по убыванию вероятности — "
-        f"код №1 наиболее вероятен по результатам поиска):\n{codes_text}"
+        f"CANDIDATE_CODES (отсортированы по убыванию релевантности):\n{codes_text}\n\n"
+        f"КЛИНИЧЕСКИЕ ПРОТОКОЛЫ (используй для строгой проверки симптомов):\n{chunks_text}"
     )
 
     response = llm_client.chat.completions.create(
@@ -270,7 +281,7 @@ async def handle_diagnose(request: DiagnoseRequest) -> DiagnoseResponse:
 
     # 3. Ask LLM to pick top-3 from the candidate dict
     try:
-        raw = call_llm(symptoms, candidate_codes)
+        raw = call_llm(symptoms, candidate_codes, chunks)
 
         # Parse, deduplicate, and guard against hallucinations.
         # We do NOT filter bare codes (e.g. S06, L10) — the evaluator uses

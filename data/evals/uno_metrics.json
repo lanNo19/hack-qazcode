@@ -1,11 +1,11 @@
 {
   "submission_name": "uno",
-  "total_protocols": 220,
-  "accuracy_at_1_percent": 2.27,
-  "recall_at_3_percent": 41.36,
-  "latency_avg_s": 4.409,
-  "latency_min_s": 2.383,
-  "latency_max_s": 4.941,
-  "latency_p50_s": 4.423,
-  "latency_p95_s": 4.808
+  "total_protocols": 221,
+  "accuracy_at_1_percent": 3.62,
+  "recall_at_3_percent": 33.94,
+  "latency_avg_s": 3.232,
+  "latency_min_s": 1.455,
+  "latency_max_s": 3.924,
+  "latency_p50_s": 3.232,
+  "latency_p95_s": 3.482
 }

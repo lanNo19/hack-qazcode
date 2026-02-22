@@ -8,188 +8,366 @@ from FlagEmbedding import BGEM3FlagModel
 from rank_bm25 import BM25Okapi
 
 
-# Matches Roman-numeral section headers embedded in continuous text,
-# e.g. "... I. ВВОДНАЯ ЧАСТЬ ..." or "... II. ОПРЕДЕЛЕНИЕ ..."
-_SECTION_SPLIT_RE = re.compile(r'(?=\s[IVXLC]+\.\s+[А-Я][А-Я\s]{2,})')
+# ---------------------------------------------------------------------------
+# DIAGNOSTIC WINDOW EXTRACTION
+#
+# Kazakhstan clinical protocols vary widely in structure, numbering, and
+# section naming conventions. The one consistent landmark across all protocol
+# types is:
+#
+#   START: first numbered/headed section containing "диагноз" or "диагностик"
+#          (whichever appears first as a proper section header)
+#   STOP:  first numbered section containing "лечени" or "цели лечения"
+#          that comes AFTER the start
+#
+# Everything between these two landmarks is the diagnostic content window —
+# symptoms, complaints, classification, differential diagnosis, physical exam,
+# lab criteria. This is the only text we embed.
+#
+# If no landmarks are found, we fall back to the first 800 words of text.
+# ---------------------------------------------------------------------------
 
-# Boilerplate ends and real content begins at the first Roman-numeral section.
-# We detect this by finding "I." followed by Cyrillic uppercase words.
-_BOILERPLATE_END_RE = re.compile(r'\bI\.\s+[А-Я][А-Я\s]{2,}')
+# START: a line that begins a section (optionally numbered) containing
+# диагноз or диагностик. Must appear as a section header, not inside prose.
+# We match: optional newline, optional number/Roman prefix, then the keyword.
+_START_PATTERN = re.compile(
+    r'\n'
+    r'(?:\d[\d\.]*\.?\s*|[IVXЛC]+\.?\s+)?'  # optional section number
+    r'(?=[^\n]{0,60}\n)'                      # line must be short (header, not prose)
+    r'[^\n]*[Дд]иагноз|'                      # contains диагноз
+    r'\n'
+    r'(?:\d[\d\.]*\.?\s*|[IVXЛC]+\.?\s+)?'
+    r'[^\n]*[Дд]иагностик',                   # or диагностик
+)
+
+# Simpler, more reliable version: just find the earliest of the two keywords
+# after skipping the title area (first 300 chars always contain the protocol
+# title "Протокол диагностики и лечения <disease>" which would fire too early)
+_DIAG_KW = re.compile(r'[Дд]иагност|[Дд]иагноз')
+
+# STOP: numbered section header containing лечени or цели
+# We require a newline + number to avoid stopping on prose mentions of лечение
+_STOP_PATTERN = re.compile(
+    r'\n\d+\.?\s*'
+    r'(?:[Цц]ели\s+[Лл]ечени'      # "14. Цели лечения"
+    r'|[Тт]актика\s+[Лл]ечени'     # "15. Тактика лечения"
+    r'|[Лл]ечени[еяю][\s\n:]'       # "X. Лечение:" / "X. Лечения" / "X. Лечению"
+    r')'
+)
+
+# Fallback stop: Roman numeral section with лечени (some older protocols)
+_STOP_ROMAN = re.compile(
+    r'\n[IVXЛC]+\.?\s+[^\n]*[Лл]ечени'
+)
+
+# Minimum diagnostic window size — if we extract something shorter than this
+# (in characters), something probably went wrong and we use fallback
+_MIN_WINDOW_CHARS = 50   # even a short section is better than 800-word fallback
+
+# If the window is longer than this (tokens), also produce a focused
+# "head chunk" containing just the first HEAD_TOKENS tokens.
+# The head almost always contains the жалобы/complaints section.
+_HEAD_TOKENS = 300
 
 
-def get_structural_chunks_from_dict(data, target_tokens=150):
+def extract_diagnostic_window(text: str) -> tuple[str, str]:
+    """
+    Extract the diagnostic window from a protocol's plain text.
+
+    Returns (window_text, strategy) where strategy is one of:
+      'landmark'  — found both start and stop landmarks
+      'start_only' — found start but no stop (used rest of text)
+      'fallback'   — no landmarks found, used first 800 words
+
+    The returned text is stripped but otherwise unmodified.
+    """
+    # Skip the title area (first ~300 chars) to avoid matching the protocol
+    # title "Протокол диагностики и лечения <disease>"
+    # Skip the approval header — all protocols start with an administrative
+    # paragraph (commission approval, date, protocol number) followed by a
+    # blank line. The actual numbered content begins after that first blank line.
+    # Using \n\n as the boundary is robust across both old and new protocol styles.
+    first_blank = text.find('\n\n')
+    title_skip = first_blank + 2 if first_blank >= 0 else 150
+
+    # Find start: search for the keyword after the title area, but require it
+    # to appear at the START of a line (preceded only by optional whitespace and
+    # an optional section number). This avoids mid-sentence matches like
+    # "по диагностике и лечению" in citation text.
+    #
+    # Two-step approach because pure regex character encoding issues make
+    # embedded Cyrillic in raw string patterns unreliable:
+    # Step 1: find any keyword occurrence
+    # Step 2: check that only a section number (or nothing) precedes it on the line
+    _section_prefix = re.compile(r'^[ \t]*(?:\d[\d.]*[.]?\s+|[IVXЛC]+[.]?\s+)?$')
+    start_pos = None
+    for _m in _DIAG_KW.finditer(text, title_skip):
+        _lb = text.rfind('\n', 0, _m.start())
+        _line_start = _lb + 1 if _lb >= 0 else 0
+        _before = text[_line_start:_m.start()]
+        if _section_prefix.match(_before):
+            start_pos = _line_start
+            break
+    if start_pos is None:
+        # No well-formed section header found — use any occurrence as fallback
+        any_match = _DIAG_KW.search(text, title_skip)
+        if not any_match:
+            words = text.split()
+            return ' '.join(words[:800]), 'fallback'
+        lb = text.rfind('\n', 0, any_match.start())
+        start_pos = lb + 1 if lb >= 0 else any_match.start()
+
+    # Find stop: first matching numbered section after start_pos
+    stop_match = _STOP_PATTERN.search(text, start_pos)
+    if not stop_match:
+        # Try Roman numeral fallback stop
+        stop_match = _STOP_ROMAN.search(text, start_pos)
+
+    if stop_match:
+        window = text[start_pos:stop_match.start()].strip()
+        strategy = 'landmark'
+    else:
+        # No stop found — use everything from start to end
+        window = text[start_pos:].strip()
+        strategy = 'start_only'
+
+    if len(window) < _MIN_WINDOW_CHARS:
+        # Extraction produced almost nothing — fall back
+        words = text.split()
+        return ' '.join(words[:800]), 'fallback'
+
+    return window, strategy
+
+
+def build_chunks_from_window(protocol_title: str, icd_codes: list[str],
+                              window: str, protocol_id: str) -> list[dict]:
+    """
+    Given the extracted diagnostic window, produce 1 or 2 chunks:
+
+    1. Full window chunk — the entire diagnostic window.
+       Used for recall: ensures all diagnostic content is reachable.
+
+    2. Head chunk (only if window > _HEAD_TOKENS tokens) — the first
+       _HEAD_TOKENS tokens of the window, which typically contains
+       the жалобы/complaints section.
+       Used for precision: clean symptom signal without table noise.
+
+    Both chunks are prefixed with protocol title and ICD codes.
+    """
+    prefix = protocol_title
+    if icd_codes:
+        prefix += f"\nМКБ-10: {', '.join(icd_codes)}"
+
+    meta = {'protocol_id': protocol_id, 'icd_codes': icd_codes}
+    chunks = []
+
+    # Chunk 1: full window
+    full_content = prefix + '\n\n' + window
+    chunks.append({
+        'content': full_content,
+        'chunk_type': 'diagnostic_window',
+        'metadata': {**meta, 'section': 'diagnostic_window'},
+    })
+
+    # Chunk 2: head-only (first HEAD_TOKENS tokens) if window is long
+    window_tokens = window.split()
+    if len(window_tokens) > _HEAD_TOKENS:
+        head_text = ' '.join(window_tokens[:_HEAD_TOKENS])
+        head_content = prefix + '\n\n' + head_text
+        chunks.append({
+            'content': head_content,
+            'chunk_type': 'diagnostic_head',
+            'metadata': {**meta, 'section': 'diagnostic_head'},
+        })
+
+    return chunks
+
+
+def get_structural_chunks_from_dict(data: dict) -> list[dict]:
+    """
+    Main entry point. Given one JSONL protocol record, extract the diagnostic
+    window and return 1–2 embeddable chunks.
+    """
     protocol_id = data.get('protocol_id', 'unknown')
     icd_codes = data.get('icd_codes', [])
     text = data.get('text', '')
     protocol_title = data.get('source_file', 'Unknown').replace('.pdf', '')
 
-    # --- Strip boilerplate ---
-    # The PDF parser produces one long string. The approval block always comes
-    # before "I. ВВОДНАЯ ЧАСТЬ" (or equivalent first Roman-numeral section).
-    # Find where actual content starts and discard everything before it.
-    match = _BOILERPLATE_END_RE.search(text)
-    if match:
-        text = text[match.start():]
+    window, strategy = extract_diagnostic_window(text)
+    chunks = build_chunks_from_window(protocol_title, icd_codes, window, protocol_id)
 
-    # --- Normalize into lines ---
-    # Split the continuous text at Roman-numeral section boundaries so the
-    # downstream header-matching logic has something to work with.
-    # Also split on numbered subsections like "1.1 " and "1.2 " etc.
-    # Replace those boundaries with a newline + the matched text.
-    text = re.sub(r'(\s)([IVXLC]+\.\s+[А-Я])', r'\n\2', text)
-    text = re.sub(r'(\s)(\d+\.\d+\s+[А-Яа-я])', r'\n\2', text)
-    text = re.sub(r'(\s)(\d+\.\s+[А-Яа-я])', r'\n\2', text)
+    # Attach extraction strategy to metadata for debugging
+    for c in chunks:
+        c['metadata']['extraction_strategy'] = strategy
 
-    header_patterns = [
-        r'^([IVXLC]+\.\s+[А-Я\s]+)$',
-        r'^(\d+\.\s+[А-Яа-я\s,]+)$',
-        r'^(\d+\.\d+\s+[А-Яа-я\s\(\),]+)$'
-    ]
+    return chunks
 
-    lines = text.split('\n')
-    structured_chunks = []
-    current_headers = ["", "", ""]
-    current_chunk_text = []
-    current_tokens = 0
 
-    def get_context_string():
-        active_headers = [h for h in current_headers if h]
-        if active_headers:
-            return f"[{protocol_title} > " + " > ".join(active_headers) + "]"
-        return f"[{protocol_title}]"
+# ---------------------------------------------------------------------------
+# Debug helpers
+# ---------------------------------------------------------------------------
 
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+def debug_protocol(data: dict):
+    """Print the extracted window and chunks for a single protocol record."""
+    protocol_title = data.get('source_file', 'Unknown')
+    text = data.get('text', '')
 
-        is_header = False
-        for i, pattern in enumerate(header_patterns):
-            if re.match(pattern, line):
-                current_headers[i] = line
-                for j in range(i + 1, len(current_headers)):
-                    current_headers[j] = ""
-                is_header = True
+    window, strategy = extract_diagnostic_window(text)
+    window_tokens = len(window.split())
+
+    print(f"\n{'='*70}")
+    print(f"Protocol  : {protocol_title}")
+    print(f"ICD codes : {data.get('icd_codes', [])}")
+    print(f"Strategy  : {strategy}")
+    print(f"Window    : {window_tokens} tokens / {len(window)} chars")
+    print(f"{'='*70}")
+    print("\n--- WINDOW START ---")
+    print(window[:400])
+    print("\n... [middle omitted] ...\n")
+    print("--- WINDOW END ---")
+    print(window[-300:])
+
+    chunks = get_structural_chunks_from_dict(data)
+    print(f"\nChunks produced: {len(chunks)}")
+    for c in chunks:
+        print(f"  {c['chunk_type']:25s} | {len(c['content'].split()):4d} tokens")
+
+
+def debug_corpus_stats(jsonl_path: str, max_protocols: int = 50):
+    """
+    Quick scan of the corpus to check window extraction quality.
+    Prints per-protocol stats and a summary.
+    """
+    strategies = {'landmark': 0, 'start_only': 0, 'fallback': 0}
+    token_counts = []
+    fallback_protocols = []
+
+    with open(jsonl_path, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            if i >= max_protocols:
                 break
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            window, strategy = extract_diagnostic_window(data.get('text', ''))
+            strategies[strategy] = strategies.get(strategy, 0) + 1
+            token_counts.append(len(window.split()))
+            if strategy == 'fallback':
+                fallback_protocols.append(data.get('source_file', '?'))
 
-        if is_header:
-            continue
-
-        line_tokens = len(line.split())
-        if current_tokens + line_tokens > target_tokens and current_chunk_text:
-            structured_chunks.append({
-                "content": get_context_string() + "\n" + "\n".join(current_chunk_text),
-                "metadata": {
-                    "protocol_id": protocol_id,
-                    "icd_codes": icd_codes,
-                    "section": current_headers[1] or current_headers[0]
-                }
-            })
-            current_chunk_text, current_tokens = [], 0
-
-        current_chunk_text.append(line)
-        current_tokens += line_tokens
-
-    if current_chunk_text:
-        structured_chunks.append({
-            "content": get_context_string() + "\n" + "\n".join(current_chunk_text),
-            "metadata": {"protocol_id": protocol_id, "icd_codes": icd_codes}
-        })
-
-    return structured_chunks
+    print(f"\nCorpus sample stats ({max_protocols} protocols):")
+    print(f"  landmark   : {strategies.get('landmark', 0)}")
+    print(f"  start_only : {strategies.get('start_only', 0)}")
+    print(f"  fallback   : {strategies.get('fallback', 0)}")
+    if token_counts:
+        print(f"  window tokens — min: {min(token_counts)}, "
+              f"max: {max(token_counts)}, "
+              f"avg: {sum(token_counts)//len(token_counts)}")
+    if fallback_protocols:
+        print(f"  fallback protocols: {fallback_protocols[:10]}")
 
 
-def encode_on_gpu(gpu_id, chunks):
-    """Loads the model on a specific GPU and processes a subset of chunks."""
+# ---------------------------------------------------------------------------
+# GPU encoding
+# ---------------------------------------------------------------------------
+
+def encode_on_gpu(gpu_id: int, chunks: list[dict]) -> dict:
     if not chunks:
         return {'dense_vecs': np.array([]), 'lexical_weights': []}
-
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
     model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+    texts = [c['content'] for c in chunks]
+    out = model.encode(texts, return_dense=True, return_sparse=True)
+    return {'dense_vecs': out['dense_vecs'], 'lexical_weights': out['lexical_weights']}
 
-    corpus_texts = [c['content'] for c in chunks]
-    outputs = model.encode(corpus_texts, return_dense=True, return_sparse=True)
 
-    return {
-        'dense_vecs': outputs['dense_vecs'],
-        'lexical_weights': outputs['lexical_weights']
-    }
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    NUM_GPUS = 5  # <--- Change this if your hardware setup changes
+    NUM_GPUS = 5  # adjust to your hardware
 
-    # 1. Parse JSONL
-    all_chunks = []
     jsonl_file_path = 'corpus/protocols_corpus.jsonl'
 
+    # Optional: run a quick corpus quality check before full encoding
+    print("=== Corpus diagnostic window extraction stats ===")
+    debug_corpus_stats(jsonl_file_path, max_protocols=9999)
+
+    # 1. Parse all protocols into chunks
+    all_chunks = []
+    protocol_count = 0
+    type_counts: dict[str, int] = {}
+    strategy_counts: dict[str, int] = {}
+
+    print("\nParsing protocols...")
     with open(jsonl_file_path, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             data = json.loads(line)
-            chunks = get_structural_chunks_from_dict(data)
-            all_chunks.extend(chunks)
+            protocol_count += 1
+            new_chunks = get_structural_chunks_from_dict(data)
+            all_chunks.extend(new_chunks)
+            for c in new_chunks:
+                ct = c['chunk_type']
+                type_counts[ct] = type_counts.get(ct, 0) + 1
+                st = c['metadata']['extraction_strategy']
+                strategy_counts[st] = strategy_counts.get(st, 0) + 1
 
-    print(f"Total chunks extracted: {len(all_chunks)}")
+    print(f"\nProtocols    : {protocol_count}")
+    print(f"Total chunks : {len(all_chunks)}  "
+          f"(avg {len(all_chunks)/protocol_count:.1f} per protocol)")
+    print("Chunk types:")
+    for ct, cnt in sorted(type_counts.items()):
+        print(f"  {ct:25s}: {cnt:5d}")
+    print("Extraction strategies:")
+    for st, cnt in sorted(strategy_counts.items()):
+        print(f"  {st:25s}: {cnt:5d}")
+    avg_len = sum(len(c['content'].split()) for c in all_chunks) / max(len(all_chunks), 1)
+    print(f"Avg chunk length: {avg_len:.0f} tokens")
 
-    # Sanity check: print the first chunk to verify boilerplate is gone
-    if all_chunks:
-        print("\nFirst chunk preview (should be clinical content, not boilerplate):")
-        print(all_chunks[0]['content'][:300])
-        print()
-
-    # 2. Build BM25 index
-    print("Building BM25 index...")
-    tokenized_corpus = [c['content'].split() for c in all_chunks]
-    bm25 = BM25Okapi(tokenized_corpus)
+    # 2. BM25
+    print("\nBuilding BM25 index...")
+    bm25 = BM25Okapi([c['content'].split() for c in all_chunks])
     with open('bm25_index.pkl', 'wb') as f:
         pickle.dump(bm25, f)
-    print("BM25 index saved to bm25_index.pkl")
+    print("→ bm25_index.pkl")
 
-    # 3. Split chunks across GPUs
+    # 3. Split for GPUs
     k, m = divmod(len(all_chunks), NUM_GPUS)
-    chunk_splits = [all_chunks[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(NUM_GPUS)]
+    splits = [
+        all_chunks[i * k + min(i, m):(i + 1) * k + min(i + 1, m)]
+        for i in range(NUM_GPUS)
+    ]
+    print(f"\nGPU split: {[len(s) for s in splits]}")
 
-    print(f"Distributing chunks across {NUM_GPUS} GPUs...")
-    for i, split in enumerate(chunk_splits):
-        print(f"GPU {i} will process: {len(split)} chunks")
+    # 4. Encode
+    with ProcessPoolExecutor(max_workers=NUM_GPUS) as ex:
+        futures = [ex.submit(encode_on_gpu, i, splits[i]) for i in range(NUM_GPUS)]
+        results = [f.result() for f in futures]
 
-    # 4. Run parallel encoding
-    results = []
-    with ProcessPoolExecutor(max_workers=NUM_GPUS) as executor:
-        futures = [executor.submit(encode_on_gpu, i, chunk_splits[i]) for i in range(NUM_GPUS)]
-        for future in futures:
-            results.append(future.result())
-
-    # 5. Merge dense embeddings
-    merged_dense = np.concatenate(
-        [res['dense_vecs'] for res in results if len(res['dense_vecs']) > 0],
-        axis=0
+    # 5. Merge and save
+    dense = np.concatenate(
+        [r['dense_vecs'] for r in results if len(r['dense_vecs'])], axis=0
     )
+    sparse = []
+    for r in results:
+        sparse.extend(r['lexical_weights'])
 
-    # 6. Merge sparse weights (list of dicts, not arrays)
-    merged_sparse = []
-    for res in results:
-        merged_sparse.extend(res['lexical_weights'])
-
-    # 7. Save to disk
     with open('processed_corpus.json', 'w', encoding='utf-8') as f:
         json.dump(all_chunks, f, ensure_ascii=False)
-
-    np.savez('embeddings.npz', dense=merged_dense)
-
-    merged_sparse_serializable = [
-        {token: float(weight) for token, weight in doc.items()}
-        for doc in merged_sparse
-    ]
+    np.savez('embeddings.npz', dense=dense)
     with open('sparse_weights.json', 'w', encoding='utf-8') as f:
-        json.dump(merged_sparse_serializable, f, ensure_ascii=False)
+        json.dump(
+            [{t: float(w) for t, w in doc.items()} for doc in sparse],
+            f, ensure_ascii=False
+        )
 
-    print(f"\nSuccessfully processed and stored {len(all_chunks)} chunks using {NUM_GPUS} GPUs.")
-    print(f"  -> embeddings.npz")
-    print(f"  -> sparse_weights.json")
-    print(f"  -> bm25_index.pkl")
-    print(f"  -> processed_corpus.json")
+    print(f"\nSaved {len(all_chunks)} chunks:")
+    print("  → processed_corpus.json")
+    print("  → embeddings.npz")
+    print("  → sparse_weights.json")
+    print("  → bm25_index.pkl")
