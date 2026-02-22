@@ -25,7 +25,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 # Copy application source
-COPY src/server.py retrieval_and_reranking.py chunking_and_embedding.py parse_icd_codes.py icd_descriptions.json embeddings.npz evaluate.py ./
+COPY src/server.py retrieval_and_reranking.py chunking_and_embedding.py parse_icd_codes.py icd_descriptions.json embeddings.npz ./
 
 # Copy and unpack pre-built index files
 COPY large_files.zip ./
