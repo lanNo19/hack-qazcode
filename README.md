@@ -4,6 +4,12 @@ AI-powered symptom → ICD-10 diagnosis system built on Kazakhstan clinical prot
 
 ---
 
+## Setup
+```bash
+git clone https://github.com//hack-qazcode.git](https://github.com/lanNo19/hack-qazcode.git
+cd hack-qazcode
+```
+
 ## Run
 
 ```bash
