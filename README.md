@@ -13,7 +13,7 @@ cd hack-qazcode
 ## Build
 
 ```bash
-docker build -t submission .
+docker build -t server .
 ```
 
 ## Run
