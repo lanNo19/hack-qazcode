@@ -9,7 +9,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from openai import OpenAI
@@ -30,42 +30,41 @@ EMBED_FILE  = os.environ.get("EMBED_FILE",  "embeddings.npz")
 SPARSE_FILE = os.environ.get("SPARSE_FILE", "sparse_weights.json")
 BM25_FILE   = os.environ.get("BM25_FILE",   "bm25_index.pkl")
 
-# FIX 1: Strict LLM timeout — prevents 40s hangs that tank latency and count as errors
-LLM_TIMEOUT = 15.0
-
-# How many chunks to retrieve and pass to the LLM
-# FIX 2: Reduced from 10 to 5 — less context = LLM follows instructions better
+LLM_TIMEOUT  = 15.0
 RERANK_TOP_N = 5
 
 # ---------------------------------------------------------------------------
 # System prompt
-# FIX 3: Much stricter prompt — explicitly forbids using chunk text as diagnosis name,
-#         requires chain-of-thought before ranking, constrains to AVAILABLE_ICD_CODES
+# Key changes vs previous version:
+# - Tell the LLM the protocols are PRE-RANKED by a medical reranker
+# - Ask it to pick the MOST SPECIFIC matching ICD code from each protocol's list
+# - Chain-of-thought: match symptoms → confirm → rank
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """\
 Ты — система клинической поддержки принятия решений на основе клинических протоколов МЗ РК.
 
-Тебе будут даны симптомы пациента и несколько фрагментов протоколов с кодами МКБ-10.
+Тебе даны симптомы пациента и список протоколов, УЖЕ отсортированных по релевантности \
+медицинским алгоритмом (Протокол 1 = наиболее релевантный по симптомам).
 
-СТРОГИЕ ПРАВИЛА:
-1. Поле "icd10_code" — ТОЛЬКО код из списка AVAILABLE_ICD_CODES. Никаких других кодов.
-2. Поле "diagnosis" — краткое медицинское название болезни (2-6 слов). НЕ копируй текст протокола.
-3. Поле "explanation" — 1-2 предложения: какие симптомы пациента совпадают с критериями протокола.
-4. Верни ровно 5 диагнозов, ранжированных по убыванию вероятности (rank 1 = наиболее вероятный).
+ЗАДАЧА: для каждого протокола выбери НАИБОЛЕЕ СПЕЦИФИЧНЫЙ код МКБ-10, который соответствует \
+симптомам пациента, и подтверди соответствие симптомов.
 
-ПРОЦЕСС (думай шаг за шагом):
-- Для каждого протокола: совпадают ли симптомы пациента с диагностическими критериями?
-- Выбери наиболее подходящий код МКБ-10 из AVAILABLE_ICD_CODES для каждого протокола.
-- Поставь на rank 1 протокол с наибольшим совпадением симптомов.
+ПРАВИЛА:
+1. "icd10_code" — ТОЛЬКО из AVAILABLE_ICD_CODES данного протокола. Выбери наиболее специфичный \
+(например, "S06.3" точнее, чем "S06").
+2. "diagnosis" — официальное медицинское название (3-7 слов). НЕ копируй текст протокола.
+3. "explanation" — 1 предложение: какие конкретные симптомы пациента совпадают с критериями.
+4. Сохраняй порядок протоколов: Протокол 1 → rank 1, если нет веских причин изменить.
+5. Верни ровно 5 объектов в списке diagnoses.
 
-Отвечай ТОЛЬКО валидным JSON. Никакого markdown, никаких пояснений вне JSON:
+Отвечай ТОЛЬКО валидным JSON без markdown:
 {
   "diagnoses": [
-    {"rank": 1, "icd10_code": "X00.0", "diagnosis": "Название болезни", "explanation": "Обоснование."},
-    {"rank": 2, "icd10_code": "Y00.0", "diagnosis": "Название болезни", "explanation": "Обоснование."},
-    {"rank": 3, "icd10_code": "Z00.0", "diagnosis": "Название болезни", "explanation": "Обоснование."},
-    {"rank": 4, "icd10_code": "A00.0", "diagnosis": "Название болезни", "explanation": "Обоснование."},
-    {"rank": 5, "icd10_code": "B00.0", "diagnosis": "Название болезни", "explanation": "Обоснование."}
+    {"rank": 1, "icd10_code": "A00.0", "diagnosis": "Название", "explanation": "Обоснование."},
+    {"rank": 2, "icd10_code": "B00.0", "diagnosis": "Название", "explanation": "Обоснование."},
+    {"rank": 3, "icd10_code": "C00.0", "diagnosis": "Название", "explanation": "Обоснование."},
+    {"rank": 4, "icd10_code": "D00.0", "diagnosis": "Название", "explanation": "Обоснование."},
+    {"rank": 5, "icd10_code": "E00.0", "diagnosis": "Название", "explanation": "Обоснование."}
   ]
 }
 """
@@ -94,10 +93,10 @@ app = FastAPI(title="Medical Diagnosis Server", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
-# Models
+# Models — FIX 422: use Optional with None default so missing fields don't fail
 # ---------------------------------------------------------------------------
 class DiagnoseRequest(BaseModel):
-    symptoms: str = ""
+    symptoms: str | None = None
 
 class Diagnosis(BaseModel):
     rank: int
@@ -113,18 +112,22 @@ class DiagnoseResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 def build_context(chunks: list[dict]) -> tuple[str, list[str]]:
-    """Format chunks for LLM. Returns (context_text, flat_icd_code_list)."""
+    """
+    Format chunks for LLM. Each protocol block includes:
+    - Its pre-rank position (so LLM knows ordering is already meaningful)
+    - Its own ICD codes listed explicitly
+    - First 400 chars of content
+    """
     parts = []
     all_icd = []
 
     for i, chunk in enumerate(chunks, 1):
         icd_codes = chunk["metadata"].get("icd_codes", [])
         all_icd.extend(icd_codes)
-        # FIX 4: Only send the first 400 chars of each chunk — enough for diagnostic criteria,
-        # cuts context length ~60% which makes the LLM much more reliable
         content_preview = chunk["content"][:400].strip()
         parts.append(
-            f"[Протокол {i} | МКБ-10: {', '.join(icd_codes) or 'н/д'}]\n{content_preview}"
+            f"[Протокол {i} (релевантность: {i}/5) | Коды МКБ-10: {', '.join(icd_codes) or 'н/д'}]\n"
+            f"{content_preview}"
         )
 
     seen = set()
@@ -134,8 +137,8 @@ def build_context(chunks: list[dict]) -> tuple[str, list[str]]:
 
 def call_llm(symptoms: str, context: str, available_icd: list[str]) -> list[dict]:
     user_message = (
-        f"AVAILABLE_ICD_CODES: {', '.join(available_icd)}\n\n"
-        f"ПРОТОКОЛЫ:\n{context}\n\n"
+        f"AVAILABLE_ICD_CODES (все допустимые коды): {', '.join(available_icd)}\n\n"
+        f"ПРОТОКОЛЫ (отсортированы по релевантности, 1 = наиболее подходящий):\n{context}\n\n"
         f"СИМПТОМЫ ПАЦИЕНТА: {symptoms}"
     )
 
@@ -145,21 +148,17 @@ def call_llm(symptoms: str, context: str, available_icd: list[str]) -> list[dict
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": user_message},
         ],
-        temperature=0.0,  # fully deterministic for clinical output
+        temperature=0.0,
     )
 
     raw = response.choices[0].message.content.strip()
-    # Strip markdown fences if present
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw).get("diagnoses", [])
 
 
 def fallback_diagnoses(chunks: list[dict]) -> list[Diagnosis]:
-    """
-    FIX 5: Better fallback — when LLM fails, return the reranked retrieval results
-    with clean diagnosis names extracted from the context string (not raw chunk text).
-    """
+    """Return retrieval results directly when LLM fails — clean names, no raw chunk text."""
     diagnoses = []
     seen_protocols = set()
     rank = 1
@@ -174,11 +173,9 @@ def fallback_diagnoses(chunks: list[dict]) -> list[Diagnosis]:
         if not icd_codes:
             continue
 
-        # Extract clean protocol name from context string e.g. "[HELLP-СИНДРОМ > ...]"
         context_match = re.match(r'\[([^\]>]+)', chunk["content"])
         protocol_name = context_match.group(1).strip() if context_match else "Неизвестно"
 
-        # Find first sentence of actual content as explanation
         lines = chunk["content"].split("\n")
         explanation = next((l.strip() for l in lines[1:] if len(l.strip()) > 20), "")[:200]
 
@@ -200,7 +197,7 @@ def fallback_diagnoses(chunks: list[dict]) -> list[Diagnosis]:
 # ---------------------------------------------------------------------------
 @app.post("/diagnose", response_model=DiagnoseResponse)
 async def handle_diagnose(request: DiagnoseRequest) -> DiagnoseResponse:
-    symptoms = request.symptoms.strip()
+    symptoms = (request.symptoms or "").strip()
     if not symptoms:
         return DiagnoseResponse(diagnoses=[])
 
@@ -219,9 +216,9 @@ async def handle_diagnose(request: DiagnoseRequest) -> DiagnoseResponse:
             for i, d in enumerate(raw_diagnoses)
         ]
         if not diagnoses:
-            raise ValueError("LLM returned empty diagnoses list")
+            raise ValueError("empty diagnoses from LLM")
     except Exception as e:
-        print(f"LLM failed ({type(e).__name__}: {e}) — using fallback")
+        print(f"LLM failed ({type(e).__name__}: {e}) — fallback")
         diagnoses = fallback_diagnoses(retrieved)
 
     return DiagnoseResponse(diagnoses=diagnoses)
