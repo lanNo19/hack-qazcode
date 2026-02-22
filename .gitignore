@@ -216,4 +216,6 @@ __marimo__/
 .streamlit/secrets.toml
 # Mac OS
 .DS_Store
-**/.DS_Store
+**/.DS_Storebm25_index.pkl
+processed_corpus.json
+sparse_weights.json
