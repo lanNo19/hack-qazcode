@@ -97,7 +97,7 @@ async def lifespan(app: FastAPI):
 
     print("Loading retriever...")
     retriever  = MedicalRetriever(CORPUS_FILE, EMBED_FILE, SPARSE_FILE, BM25_FILE)
-    llm_client = OpenAI(base_url=HUB_URL, api_key=API_KEY, timeout=LLM_TIMEOUT)
+    llm_client = OpenAI(base_url=HUB_URL, api_key=API_KEY)
     print("✓ Ready. POST /diagnose")
     print("=" * 40 + "\n")
     yield
@@ -210,8 +210,8 @@ def call_llm(symptoms: str, candidate_codes: dict[str, str], chunks: list[dict])
         # We extract the protocol title if available, otherwise just number it
         protocol_title = chunk.get("metadata", {}).get("title", f"Протокол {i}")
         content = chunk.get("content", "").strip()
-        if len(content) > 1500:
-            content = content[:1500] + "... [ОСТАЛЬНОЙ ТЕКСТ УРЕЗАН]"
+        if len(content) > 1000:
+            content = content[:1000] + "... [ОСТАЛЬНОЙ ТЕКСТ УРЕЗАН]"
         
         chunks_text += f"\n--- ТЕКСТ ПРОТОКОЛА {i}: {protocol_title} ---\n{content}\n"
 

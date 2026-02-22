@@ -92,11 +92,17 @@ async def run_evaluation(
     endpoint: str,
     dataset_dir: Path,
     parallelism: int,
+    limit: int = None,
 ) -> list[EvaluationResult]:
     """Run evaluation on all JSON files in the dataset directory."""
     console = Console()
 
     json_files = list(dataset_dir.glob("*.json"))
+
+    if limit is not None and limit > 0:
+        json_files = json_files[:limit]
+
+
     if not json_files:
         console.print(f"[red]No JSON files found in {dataset_dir}[/red]")
         return []
@@ -319,6 +325,14 @@ Examples:
         help="Output directory for results (default: data/evals)",
     )
 
+    parser.add_argument(
+        "-l",
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit the number of protocols to evaluate for faster debugging",
+    )
+
     args = parser.parse_args()
     console = Console()
 
@@ -339,6 +353,7 @@ Examples:
             endpoint=args.endpoint,
             dataset_dir=args.dataset_dir,
             parallelism=args.parallelism,
+            limit=args.limit,
         )
     )
 

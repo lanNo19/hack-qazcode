@@ -67,12 +67,15 @@ class MedicalRetriever:
         if bm25_max > 0:
             bm25_scores = bm25_scores / bm25_max
 
-        # Pre-filter to dense top-100 before computing sparse scores
-        # (sparse scoring is a Python dict loop — too slow over the full corpus)
-        dense_top100_indices = np.argpartition(dense_scores, -100)[-100:]
+        # Pre-filter to dense top 500 to save compute on the sparse scoring step (which is more expensive)
+        prefilter_k = min(500, len(dense_scores))
+        if prefilter_k == len(dense_scores):
+            dense_top_indices = np.arange(len(dense_scores))
+        else:
+            dense_top_indices = np.argpartition(dense_scores, -prefilter_k)[-prefilter_k:]
 
         scores = []
-        for i in dense_top100_indices:
+        for i in dense_top_indices:
             s_score = self.compute_sparse_score(q_sparse, self.sparse_embeddings[i])
             hybrid_score = (
                 dense_weight  * float(dense_scores[i]) +

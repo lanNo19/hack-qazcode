@@ -1,0 +1,11 @@
+{
+  "submission_name": "dev_test",
+  "total_protocols": 10,
+  "accuracy_at_1_percent": 10.0,
+  "recall_at_3_percent": 50.0,
+  "latency_avg_s": 31.232,
+  "latency_min_s": 17.361,
+  "latency_max_s": 43.604,
+  "latency_p50_s": 29.342,
+  "latency_p95_s": 44.197
+}
